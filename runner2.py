@@ -1,88 +1,62 @@
 import os
-import gc
-import logging
 import torch
-from transformers import (
-    Trainer,
-    TrainingArguments,
-    EarlyStoppingCallback,
-    AutoModelForCausalLM,
-    DataCollatorWithPadding,
-)
+from transformers import Trainer, AutoModelForCausalLM
+from transformers import BitsAndBytesConfig
+from typing import Dict, Optional
+import logging
+
+from core import tokenizer, device, MODEL_NAME_OR_PATH, get_quantization_config
+from runner3 import clear_cuda_memory, log_cuda_memory, save_progress, load_progress
 
 logger = logging.getLogger(__name__)
 
-def clear_cuda_memory():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-    gc.collect()
+def train_on_dataset(dataset_name: str, tokenized_dataset: dict, progress: Dict, model_path: Optional[str] = None) -> None:
+    """
+    Train the model on a given tokenized dataset.
 
-def log_gpu_memory(stage="", device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        logger.info(f"[{stage}] CUDA memory allocated: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
-        logger.info(f"[{stage}] CUDA memory reserved:  {torch.cuda.memory_reserved() / 1e6:.2f} MB")
-        logger.debug(torch.cuda.memory_summary(device=device.index, abbreviated=True))
+    Args:
+        dataset_name (str): Name of the dataset for logging and saving.
+        tokenized_dataset (dict): Tokenized dataset inputs.
+        progress (dict): Training progress dictionary to update.
+        model_path (str, optional): Path or name of the pretrained model.
+    """
+    model_path = model_path or MODEL_NAME_OR_PATH
+    clear_cuda_memory()
+    log_cuda_memory()
 
-def load_8bit_model(model_name_or_path):
-    import bitsandbytes as bnb  # must be installed
-    logger.info(f"Loading model {model_name_or_path} in 8-bit mode...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        load_in_8bit=True,
-        device_map="auto",
-        torch_dtype=torch.float16,
-    )
-    return model
+    try:
+        quant_config = get_quantization_config()
+        logger.info(f"Loading model {model_path} with 8-bit quantization...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="auto",
+            quantization_config=quant_config,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        ).to(device)
 
-def get_data_collator(tokenizer):
-    return DataCollatorWithPadding(tokenizer=tokenizer)
+        trainer = Trainer(
+            model=model,
+            train_dataset=tokenized_dataset,
+            tokenizer=tokenizer,
+            # Add any other Trainer args here as needed.
+        )
+        
+        logger.info(f"Starting training on dataset: {dataset_name}")
+        trainer.train()
+        logger.info(f"Training complete on dataset: {dataset_name}")
 
-def get_optimal_batch_size():
-    # Adjust depending on GPU memory
-    return 4, 2  # batch size, grad accumulation steps
+        progress[dataset_name] = "trained"
+        save_progress(progress)
 
-def prepare_trainer(
-    model,
-    tokenizer,
-    train_dataset,
-    eval_dataset,
-    output_dir,
-    batch_size,
-    grad_accum_steps,
-    max_epochs,
-):
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        eval_strategy="steps",
-        eval_steps=100,
-        save_strategy="steps",
-        save_steps=100,
-        learning_rate=5e-5,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum_steps,
-        num_train_epochs=max_epochs,
-        save_total_limit=3,
-        logging_dir=os.path.join(output_dir, "logs"),
-        logging_steps=10,
-        load_best_model_at_end=True,
-        metric_for_best_model="loss",
-        greater_is_better=False,
-        fp16=False,
-        push_to_hub=False,
-        report_to="none",
-    )
+        # Save the fine-tuned model checkpoint
+        save_dir = os.path.join("models", dataset_name)
+        os.makedirs(save_dir, exist_ok=True)
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+        logger.info(f"Model checkpoint saved to {save_dir}")
 
-    data_collator = get_data_collator(tokenizer)
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
-    )
-    return trainer
+    except Exception as e:
+        logger.error(f"Training failed for dataset {dataset_name}: {e}", exc_info=True)
+    finally:
+        clear_cuda_memory()
